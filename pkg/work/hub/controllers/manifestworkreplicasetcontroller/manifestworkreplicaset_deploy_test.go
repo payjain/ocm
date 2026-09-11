@@ -27,6 +27,7 @@ import (
 	workapplier "open-cluster-management.io/sdk-go/pkg/apis/work/v1/applier"
 
 	"open-cluster-management.io/ocm/pkg/common/helpers"
+	workhelper "open-cluster-management.io/ocm/pkg/work/helper"
 	helpertest "open-cluster-management.io/ocm/pkg/work/hub/test"
 )
 
@@ -1402,8 +1403,8 @@ func listWorksByMWRS(
 ) ([]workapiv1.ManifestWork, error) {
 
 	selector := labels.Set{
-		workapiv1alpha1.ManifestWorkReplicaSetControllerNameLabelKey: fmt.Sprintf("%s.%s", mwrNamespace, mwrName),
-		workapiv1alpha1.ManifestWorkReplicaSetPlacementNameLabelKey:  placement,
+		workhelper.ManifestWorkReplicaSetOwnerKeyHashLabelKey:       ownerKeyHash(mwrNamespace, mwrName),
+		workapiv1alpha1.ManifestWorkReplicaSetPlacementNameLabelKey: placement,
 	}.AsSelector().String()
 
 	list, err := client.WorkV1().
@@ -1752,9 +1753,9 @@ func TestIsConditionReady(t *testing.T) {
 	}
 }
 
-func TestDeployReconcileOwnerLabelTooLong(t *testing.T) {
-	// "default." + longName exceeds the 63-char label-value limit, so the owner
-	// label value is invalid and the reconciler should report it on status.
+func TestDeployReconcileLongOwnerNameUsesHashLabel(t *testing.T) {
+	// "default." + longName exceeds the 63-char label-value limit, but the
+	// hash-based owner label always fits so reconcile should succeed.
 	longName := "mwrset-" + strings.Repeat("x", 60)
 	mwrSet := helpertest.CreateTestManifestWorkReplicaSet(longName, "default", "place-test")
 
@@ -1784,32 +1785,100 @@ func TestDeployReconcileOwnerLabelTooLong(t *testing.T) {
 
 	mwrSet, state, err := pmwDeployController.reconcile(context.TODO(), mwrSet)
 	if err != nil {
-		t.Fatal("expected no error so the invalid name is reported via status, got ", err)
+		t.Fatal("expected no error, got ", err)
 	}
-	if state != reconcileStop {
-		t.Fatal("expected reconcileStop for a permanently invalid owner label, got ", state)
-	}
-
-	cond := apimeta.FindStatusCondition(mwrSet.Status.Conditions, workapiv1alpha1.ManifestWorkReplicaSetConditionManifestworkApplied)
-	if cond == nil {
-		t.Fatal("ManifestworkApplied condition not found ", mwrSet.Status.Conditions)
-	}
-	if cond.Status != metav1.ConditionFalse {
-		t.Fatal("expected ManifestworkApplied=False, got ", cond)
-	}
-	if cond.Reason != ReasonInvalidManifestWorkName {
-		t.Fatal("expected Reason ReasonInvalidManifestWorkName, got ", cond.Reason)
-	}
-	if !strings.Contains(cond.Message, "63") {
-		t.Fatal("expected message to reference the 63-char limit, got ", cond.Message)
+	if state == reconcileStop {
+		t.Fatal("expected reconcileContinue, long names should work with hash labels")
 	}
 
-	// No ManifestWork should have been applied for the invalid owner value.
+	// A ManifestWork should have been created.
 	works, err := fWorkClient.WorkV1().ManifestWorks("cls1").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(works.Items) != 0 {
-		t.Fatal("expected no ManifestWork to be applied, got ", len(works.Items))
+	if len(works.Items) != 1 {
+		t.Fatalf("expected 1 ManifestWork, got %d", len(works.Items))
 	}
+
+	mw := works.Items[0]
+	expectedHash := ownerKeyHash(mwrSet.Namespace, mwrSet.Name)
+	assert.Equal(t, expectedHash, mw.Labels[workhelper.ManifestWorkReplicaSetOwnerKeyHashLabelKey],
+		"hash label should be set")
+	assert.Equal(t, fmt.Sprintf("%s/%s", mwrSet.Namespace, mwrSet.Name),
+		mw.Annotations[workhelper.ManifestWorkReplicaSetOwnerAnnotationKey],
+		"owner annotation should be set")
+
+	// The deprecated label must NOT be set because namespace.name > 63 chars.
+	_, hasOldLabel := mw.Labels[workapiv1alpha1.ManifestWorkReplicaSetControllerNameLabelKey]
+	assert.False(t, hasOldLabel,
+		"deprecated label should not be set when namespace.name exceeds 63 chars")
+}
+
+func TestBuildManifestWorkLabelsAndAnnotations(t *testing.T) {
+	tests := []struct {
+		name           string
+		mwrsName       string
+		mwrsNamespace  string
+		expectOldLabel bool
+	}{
+		{
+			name:           "short name sets both labels and annotation",
+			mwrsName:       "short",
+			mwrsNamespace:  "default",
+			expectOldLabel: true,
+		},
+		{
+			name:           "long name sets only hash label and annotation",
+			mwrsName:       "mwrset-" + strings.Repeat("x", 60),
+			mwrsNamespace:  "default",
+			expectOldLabel: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mwrSet := helpertest.CreateTestManifestWorkReplicaSet(tt.mwrsName, tt.mwrsNamespace, "place-test")
+			mw := buildManifestWork(mwrSet, "", "cls1", "place-test")
+
+			expectedHash := ownerKeyHash(tt.mwrsNamespace, tt.mwrsName)
+			assert.Equal(t, expectedHash, mw.Labels[workhelper.ManifestWorkReplicaSetOwnerKeyHashLabelKey])
+
+			expectedOwnerRef := fmt.Sprintf("%s/%s", tt.mwrsNamespace, tt.mwrsName)
+			assert.Equal(t, expectedOwnerRef, mw.Annotations[workhelper.ManifestWorkReplicaSetOwnerAnnotationKey])
+
+			assert.Equal(t, "place-test", mw.Labels[workapiv1alpha1.ManifestWorkReplicaSetPlacementNameLabelKey])
+
+			oldValue, hasOld := mw.Labels[workapiv1alpha1.ManifestWorkReplicaSetControllerNameLabelKey]
+			if tt.expectOldLabel {
+				assert.True(t, hasOld, "deprecated label should be present for short names")
+				assert.Equal(t, fmt.Sprintf("%s.%s", tt.mwrsNamespace, tt.mwrsName), oldValue)
+			} else {
+				assert.False(t, hasOld, "deprecated label should not be present for long names")
+			}
+		})
+	}
+}
+
+func TestBuildManifestWorkStripsForgedDeprecatedLabel(t *testing.T) {
+	longName := strings.Repeat("x", 60)
+	longNS := "long-ns"
+
+	mwrSet := helpertest.CreateTestManifestWorkReplicaSet(longName, longNS, "place-test")
+	// Simulate a user-supplied deprecated label on the MWRS itself
+	mwrSet.Labels = map[string]string{
+		workapiv1alpha1.ManifestWorkReplicaSetControllerNameLabelKey: "attacker.short",
+	}
+
+	mw := buildManifestWork(mwrSet, "", "cls1", "place-test")
+
+	// The deprecated label must be stripped because the owner key exceeds 63 chars
+	_, hasOld := mw.Labels[workapiv1alpha1.ManifestWorkReplicaSetControllerNameLabelKey]
+	assert.False(t, hasOld,
+		"forged deprecated label should be stripped for long owner keys")
+
+	// Hash label and annotation must still be set correctly
+	assert.Equal(t, ownerKeyHash(longNS, longName),
+		mw.Labels[workhelper.ManifestWorkReplicaSetOwnerKeyHashLabelKey])
+	assert.Equal(t, fmt.Sprintf("%s/%s", longNS, longName),
+		mw.Annotations[workhelper.ManifestWorkReplicaSetOwnerAnnotationKey])
 }

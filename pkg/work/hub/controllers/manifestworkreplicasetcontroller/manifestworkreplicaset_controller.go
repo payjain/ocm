@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -32,6 +33,7 @@ import (
 
 	"open-cluster-management.io/ocm/pkg/common/helpers"
 	"open-cluster-management.io/ocm/pkg/common/queue"
+	workhelper "open-cluster-management.io/ocm/pkg/work/helper"
 )
 
 // maxRequeueTime is the same as the informer resync period
@@ -59,17 +61,49 @@ type manifestWorkWithPlacements struct {
 
 func getManifestWorkInReplicaSet(mwrs *workapiv1alpha1.ManifestWorkReplicaSet,
 	manifestWorkLister worklisterv1.ManifestWorkLister) (*manifestWorkInReplicaSet, []*workapiv1.ManifestWork, error) {
-	req, err := labels.NewRequirement(
-		workapiv1alpha1.ManifestWorkReplicaSetControllerNameLabelKey,
-		selection.Equals, []string{manifestWorkReplicaSetKey(mwrs)})
+	// Select by the new hash label (primary).
+	hashReq, err := labels.NewRequirement(
+		workhelper.ManifestWorkReplicaSetOwnerKeyHashLabelKey,
+		selection.Equals, []string{ownerKeyHash(mwrs.Namespace, mwrs.Name)})
+	if err != nil {
+		return nil, nil, err
+	}
+	hashSelector := labels.NewSelector().Add(*hashReq)
+	mws, err := manifestWorkLister.List(hashSelector)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	selector := labels.NewSelector().Add(*req)
-	mws, err := manifestWorkLister.List(selector)
-	if err != nil {
-		return nil, nil, err
+	// Also select by the deprecated label to find pre-upgrade ManifestWorks that
+	// only have the old label. Merge the results, deduplicating by UID.
+	oldValue := manifestWorkReplicaSetKey(mwrs)
+	if len(oldValue) <= 63 {
+		oldReq, err := labels.NewRequirement(
+			workapiv1alpha1.ManifestWorkReplicaSetControllerNameLabelKey,
+			selection.Equals, []string{oldValue})
+		if err != nil {
+			klog.V(4).Infof("failed to build deprecated-label selector for MWRS %s/%s: %v", mwrs.Namespace, mwrs.Name, err)
+		} else {
+			oldSelector := labels.NewSelector().Add(*oldReq)
+			oldMWs, listErr := manifestWorkLister.List(oldSelector)
+			if listErr != nil {
+				klog.V(4).Infof("failed to list ManifestWorks by deprecated label for MWRS %s/%s: %v", mwrs.Namespace, mwrs.Name, listErr)
+			} else {
+				seen := sets.New[types.UID]()
+				for _, mw := range mws {
+					seen.Insert(mw.UID)
+				}
+				for _, mw := range oldMWs {
+					if seen.Has(mw.UID) {
+						continue
+					}
+					if _, hasHash := mw.Labels[workhelper.ManifestWorkReplicaSetOwnerKeyHashLabelKey]; hasHash {
+						continue
+					}
+					mws = append(mws, mw)
+				}
+			}
+		}
 	}
 
 	result := &manifestWorkInReplicaSet{
@@ -142,21 +176,50 @@ func NewManifestWorkReplicaSetController(
 		WithInformersQueueKeysFunc(queue.QueueKeyByMetaNamespaceName, manifestWorkReplicaSetInformer.Informer()).
 		WithFilteredEventsInformersQueueKeysFunc(func(obj runtime.Object) []string {
 			accessor, _ := meta.Accessor(obj)
+
+			// Prefer the annotation for the queue key (stores "namespace/name").
+			if annotations := accessor.GetAnnotations(); annotations != nil {
+				if ownerRef, ok := annotations[workhelper.ManifestWorkReplicaSetOwnerAnnotationKey]; ok {
+					return []string{ownerRef}
+				}
+			}
+
+			// Fall back to the deprecated label for pre-upgrade ManifestWorks.
 			labelValue, ok := accessor.GetLabels()[workapiv1alpha1.ManifestWorkReplicaSetControllerNameLabelKey]
 			if !ok {
 				return []string{}
 			}
-			keys := strings.Split(labelValue, ".")
-			if len(keys) != 2 {
+			parts := strings.SplitN(labelValue, ".", 2)
+			if len(parts) != 2 {
 				return []string{}
 			}
-			return []string{fmt.Sprintf("%s/%s", keys[0], keys[1])}
+			return []string{fmt.Sprintf("%s/%s", parts[0], parts[1])}
 		},
-			queue.FileterByLabel(workapiv1alpha1.ManifestWorkReplicaSetControllerNameLabelKey),
+			filterByMWRSOwnership,
 			manifestWorkInformer.Informer()).
 		WithInformersQueueKeysFunc(controller.placementDecisionQueueKeysFunc, placeDecisionInformer.Informer()).
 		WithInformersQueueKeysFunc(controller.placementQueueKeysFunc, placementInformer.Informer()).
 		WithSync(controller.sync).ToController("ManifestWorkReplicaSetController")
+}
+
+// filterByMWRSOwnership returns true if the object has either the new hash
+// label or the deprecated old label, indicating it is owned by an MWRS.
+func filterByMWRSOwnership(obj interface{}) bool {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		return false
+	}
+	lbls := accessor.GetLabels()
+	if len(lbls) == 0 {
+		return false
+	}
+	if len(lbls[workhelper.ManifestWorkReplicaSetOwnerKeyHashLabelKey]) > 0 {
+		return true
+	}
+	return len(lbls[workapiv1alpha1.ManifestWorkReplicaSetControllerNameLabelKey]) > 0
 }
 
 func newController(
