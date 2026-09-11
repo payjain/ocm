@@ -33,6 +33,8 @@ const (
 	minCleanupPriority cleanupPriority = 0
 	// the max priority, the resources with this priority will be last deleted.
 	maxCleanupPriority cleanupPriority = 100
+
+	gcListPageSize int64 = 500
 )
 
 var requeueError = helpers.NewRequeueError("gc requeue", 5*time.Second)
@@ -50,8 +52,7 @@ func (r *gcResourcesController) reconcile(ctx context.Context,
 	var errs []error
 	// delete the resources in order. to delete the next resource after all resource instances are deleted.
 	for _, resourceGVR := range r.resourceGVRList {
-		resourceList, err := r.metadataClient.Resource(resourceGVR).
-			Namespace(clusterNamespace).List(ctx, metav1.ListOptions{})
+		resourceList, err := r.listResourcePages(ctx, resourceGVR, clusterNamespace)
 		if errors.IsNotFound(err) {
 			continue
 		}
@@ -99,6 +100,24 @@ func (r *gcResourcesController) reconcile(ctx context.Context,
 		})
 	}
 	return nil
+}
+
+func (r *gcResourcesController) listResourcePages(ctx context.Context,
+	gvr schema.GroupVersionResource, namespace string) (*metav1.PartialObjectMetadataList, error) {
+	var allItems []metav1.PartialObjectMetadata
+	listOpts := metav1.ListOptions{Limit: gcListPageSize}
+	for {
+		page, err := r.metadataClient.Resource(gvr).Namespace(namespace).List(ctx, listOpts)
+		if err != nil {
+			return nil, err
+		}
+		allItems = append(allItems, page.Items...)
+		if page.Continue == "" {
+			break
+		}
+		listOpts.Continue = page.Continue
+	}
+	return &metav1.PartialObjectMetadataList{Items: allItems}, nil
 }
 
 func mapPriorityResource(resourceList *metav1.PartialObjectMetadataList) map[cleanupPriority][]string {
