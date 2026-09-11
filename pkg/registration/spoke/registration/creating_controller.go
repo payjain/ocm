@@ -132,6 +132,21 @@ func AnnotationDecorator(annotations map[string]string) ManagedClusterDecorator 
 	}
 }
 
+func LabelDecorator(labels map[string]string) ManagedClusterDecorator {
+	return func(cluster *clusterv1.ManagedCluster) *clusterv1.ManagedCluster {
+		if len(labels) == 0 {
+			return cluster
+		}
+		if cluster.Labels == nil {
+			cluster.Labels = make(map[string]string)
+		}
+		for key, value := range labels {
+			cluster.Labels[key] = value
+		}
+		return cluster
+	}
+}
+
 // ClientConfigDecorator merge ClientConfig
 func ClientConfigDecorator(externalServerURLs []string, caBundle []byte) ManagedClusterDecorator {
 	return func(cluster *clusterv1.ManagedCluster) *clusterv1.ManagedCluster {
