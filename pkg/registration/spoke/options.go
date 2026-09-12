@@ -45,6 +45,7 @@ type SpokeAgentOptions struct {
 	RegisterDriverOption *registerfactory.Options
 }
 
+// NewSpokeAgentOptions returns a SpokeAgentOptions with default values.
 func NewSpokeAgentOptions() *SpokeAgentOptions {
 	options := &SpokeAgentOptions{
 		BootstrapKubeconfigSecret:   "bootstrap-hub-kubeconfig",

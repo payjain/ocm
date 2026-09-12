@@ -60,6 +60,7 @@ func buildClusterAnnotationsString(annotations map[string]string) string {
 	return strings.Join(arr, ",")
 }
 
+// buildClusterLabelsString serializes labels into a deterministically sorted comma-separated key=value string.
 func buildClusterLabelsString(labels map[string]string) string {
 	if len(labels) == 0 {
 		return ""

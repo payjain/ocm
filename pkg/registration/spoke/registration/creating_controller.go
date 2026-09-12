@@ -119,6 +119,7 @@ func skipUnauthorizedError(err error) error {
 	return err
 }
 
+// AnnotationDecorator returns a ManagedClusterDecorator that applies the given annotations to a ManagedCluster.
 func AnnotationDecorator(annotations map[string]string) ManagedClusterDecorator {
 	return func(cluster *clusterv1.ManagedCluster) *clusterv1.ManagedCluster {
 		filteredAnnotations := commonhelpers.FilterClusterAnnotations(annotations)
@@ -132,6 +133,7 @@ func AnnotationDecorator(annotations map[string]string) ManagedClusterDecorator 
 	}
 }
 
+// LabelDecorator returns a ManagedClusterDecorator that applies the given labels to a ManagedCluster.
 func LabelDecorator(labels map[string]string) ManagedClusterDecorator {
 	return func(cluster *clusterv1.ManagedCluster) *clusterv1.ManagedCluster {
 		if len(labels) == 0 {
