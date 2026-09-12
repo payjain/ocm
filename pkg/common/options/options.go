@@ -129,6 +129,9 @@ func (o *Options) ApplyTLSToCommand(cmd *cobra.Command) {
 		if (o.TLSMinVersion == "" && o.TLSCipherSuites == "" && o.HealthCheckPort == 0) || cmd.Flags().Changed("config") {
 			return nil
 		}
+		if o.HealthCheckPort != 0 && (o.HealthCheckPort < 1 || o.HealthCheckPort > 65535) {
+			return fmt.Errorf("invalid --health-port value %d: must be 0 or between 1 and 65535", o.HealthCheckPort)
+		}
 		// Validate TLS flags up-front so invalid values are caught early with a
 		// clear error rather than being deferred to library-go's YAML parsing.
 		if o.TLSMinVersion != "" || o.TLSCipherSuites != "" {
@@ -158,7 +161,7 @@ func operatorNamespace(cmd *cobra.Command) string {
 // kube client and namespace, and if found, writes the TLS serving config file.
 // Returns nil if the ConfigMap is not found (graceful no-op).
 // Extracted for testability.
-func applyTLSFromConfigMap(ctx context.Context, kubeClient kubernetes.Interface, namespace string, cmd *cobra.Command) error {
+func applyTLSFromConfigMap(ctx context.Context, kubeClient kubernetes.Interface, namespace string, cmd *cobra.Command, healthPort int32) error {
 	tlsCfg, err := tlslib.LoadTLSConfigFromConfigMap(ctx, kubeClient, namespace)
 	if err != nil {
 		return fmt.Errorf("failed to load TLS config from ConfigMap: %w", err)
@@ -172,7 +175,7 @@ func applyTLSFromConfigMap(ctx context.Context, kubeClient kubernetes.Interface,
 	if len(tlsCfg.CipherSuites) > 0 {
 		cipherSuites = tlslib.CipherSuitesToString(tlsCfg.CipherSuites)
 	}
-	return writeTLSServingConfig(cmd, minVersion, cipherSuites, 0)
+	return writeTLSServingConfig(cmd, minVersion, cipherSuites, healthPort)
 }
 
 // ApplyTLSFromConfigMapToCommand installs a PersistentPreRunE hook that reads
@@ -215,6 +218,6 @@ func (o *Options) ApplyTLSFromConfigMapToCommand(cmd *cobra.Command) {
 		if err != nil {
 			return fmt.Errorf("failed to create kube client for TLS ConfigMap: %w", err)
 		}
-		return applyTLSFromConfigMap(context.Background(), kubeClient, namespace, cmd)
+		return applyTLSFromConfigMap(context.Background(), kubeClient, namespace, cmd, o.HealthCheckPort)
 	}
 }

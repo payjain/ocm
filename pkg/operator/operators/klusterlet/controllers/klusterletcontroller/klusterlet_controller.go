@@ -319,10 +319,14 @@ func (n *klusterletController) sync(ctx context.Context, controllerContext facto
 		DisableAddonNamespace:           n.disableAddonNamespace,
 	}
 
-	if klusterlet.Spec.HealthCheckPort > 0 {
-		config.HealthCheckPort = klusterlet.Spec.HealthCheckPort
-	} else {
+	switch {
+	case klusterlet.Spec.HealthCheckPort == 0:
 		config.HealthCheckPort = 8443
+	case klusterlet.Spec.HealthCheckPort >= 1024 && klusterlet.Spec.HealthCheckPort <= 65535:
+		config.HealthCheckPort = klusterlet.Spec.HealthCheckPort
+	default:
+		return fmt.Errorf("invalid healthCheckPort %d: must be 0 (default 8443) or between 1024 and 65535",
+			klusterlet.Spec.HealthCheckPort)
 	}
 
 	if klusterlet.Spec.DeployOption.ReportHostingCluster == operatorapiv1.ReportHostingClusterModeEnable {
